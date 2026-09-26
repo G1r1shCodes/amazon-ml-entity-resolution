@@ -92,7 +92,7 @@ class TFIDFBlocker:
         n_queries = s1_matrix.shape[0]
         n_batches = (n_queries + query_batch_size - 1) // query_batch_size
 
-        target_matrix_T = target_matrix.T.tocsc()
+        target_matrix_T = target_matrix.T  # Already CSC matrix view, zero cost!
 
         for b in range(n_batches):
             q_start = b * query_batch_size
@@ -101,7 +101,10 @@ class TFIDFBlocker:
             
             t0 = time.time()
             sim_sub = s1_sub.dot(target_matrix_T)
+            dt_dot = time.time() - t0
+            print(f"  Dot product calculated in {dt_dot:.1f}s. Extracting Top-{k} candidates...", flush=True)
             
+            t1 = time.time()
             # Fast vectorized top-k extraction per row from indptr/indices/data arrays
             indptr = sim_sub.indptr
             indices = sim_sub.indices
@@ -121,9 +124,8 @@ class TFIDFBlocker:
                     sub = sub[np.argsort(r_data[sub])[::-1]]
                     candidates_per_row.append(r_ind[sub].tolist())
             
-            dt = time.time() - t0
-            if n_batches > 1:
-                print(f"    Query batch {b+1}/{n_batches} processed in {dt:.1f}s", flush=True)
+            dt_topk = time.time() - t1
+            print(f"  Top-{k} candidates extracted in {dt_topk:.1f}s.", flush=True)
 
         return candidates_per_row
 
