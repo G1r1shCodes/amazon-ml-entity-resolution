@@ -54,23 +54,54 @@ class TFIDFBlocker:
         target_matrix: csr_matrix,
         top_k: Optional[int] = None
     ) -> List[List[int]]:
-        """Retrieve top-K nearest indices for each Source 1 record using fast sparse cosine similarity."""
+        """Retrieve top-K nearest indices for each Source 1 record using PyTorch CUDA GPU tensor operations."""
         k = top_k or self.top_k
         print(f"  Transforming {len(s1_texts)} Source 1 records to TF-IDF sparse matrix...")
         s1_matrix = self.vectorizer.transform(s1_texts)
-        
-        print(f"  Calculating sparse matrix dot product ({s1_matrix.shape[0]} x {target_matrix.shape[0]})...")
-        # Sparse matrix dot product (sub-second calculation)
+
+        if torch.cuda.is_available() and self.device.startswith("cuda"):
+            try:
+                device_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
+                device_obj = torch.device(f"cuda:{device_id}")
+                print(f"⚡ Moving Sparse Matrices to GPU ({device_obj}) VRAM...")
+
+                # Convert target matrix to PyTorch CUDA sparse COO tensor
+                t_coo = target_matrix.tocoo()
+                t_idx = torch.from_numpy(np.vstack((t_coo.row, t_coo.col))).to(torch.int64).to(device_obj)
+                t_val = torch.from_numpy(t_coo.data).to(torch.float32).to(device_obj)
+                t_gpu = torch.sparse_coo_tensor(t_idx, t_val, torch.Size(t_coo.shape), device=device_obj).coalesce()
+                t_gpu_T = torch.sparse_coo_tensor(
+                    torch.stack([t_idx[1], t_idx[0]]), t_val, torch.Size((t_coo.shape[1], t_coo.shape[0])), device=device_obj
+                ).coalesce()
+
+                # Convert s1 matrix to PyTorch CUDA sparse tensor
+                s1_coo = s1_matrix.tocoo()
+                s1_idx = torch.from_numpy(np.vstack((s1_coo.row, s1_coo.col))).to(torch.int64).to(device_obj)
+                s1_val = torch.from_numpy(s1_coo.data).to(torch.float32).to(device_obj)
+                s1_gpu = torch.sparse_coo_tensor(s1_idx, s1_val, torch.Size(s1_coo.shape), device=device_obj).coalesce()
+
+                print(f"🔥 Executing PyTorch Sparse Cosine Similarity on GPU ({device_obj})...")
+                # PyTorch GPU Sparse Matrix Multiplication
+                sim_gpu = torch.sparse.mm(s1_gpu, t_gpu_T).to_dense()
+
+                print(f"🎯 Extracting Top-{k} Candidates on GPU ({device_obj})...")
+                top_vals, top_indices = torch.topk(sim_gpu, k=min(k, sim_gpu.shape[1]), dim=1)
+                
+                candidates_per_row = top_indices.cpu().numpy().tolist()
+                return candidates_per_row
+            except Exception as e:
+                print(f"⚠️ PyTorch GPU execution fallback to CPU due to: {e}")
+
+        # CPU Fallback
+        print(f"  Calculating sparse matrix dot product on CPU ({s1_matrix.shape[0]} x {target_matrix.shape[0]})...")
         sim_matrix = s1_matrix.dot(target_matrix.T)
         
-        print(f"  Extracting Top-{k} candidates for each Source 1 entity...")
         candidates_per_row = []
         for i in range(sim_matrix.shape[0]):
             row = sim_matrix.getrow(i)
             if row.nnz == 0:
                 candidates_per_row.append([])
                 continue
-            # Get top K indices with highest cosine similarity
             if row.nnz <= k:
                 top_indices = row.indices[np.argsort(row.data)[::-1]]
             else:
