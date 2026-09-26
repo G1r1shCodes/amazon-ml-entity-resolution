@@ -1,5 +1,8 @@
-# Data & Datasets
+# Data & Datasets (Ignored by Git)
 dataset/
+6ab10eb3b23ba_student_resource/
+*.zip
+*.tsv
 
 # Python Virtual Environments
 venv/
@@ -16,6 +19,6 @@ __pycache__/
 # Jupyter Notebooks
 .ipynb_checkpoints/
 
-# System Files
+# System & OS Files
 .DS_Store
 Thumbs.db
