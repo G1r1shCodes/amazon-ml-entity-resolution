@@ -6,10 +6,12 @@ Uses TF-IDF Character 3-Gram vector similarity + inverted token indexing for hig
 """
 
 import re
+import time
 from typing import Dict, List, Set, Tuple, Optional
 import pandas as pd
 import numpy as np
 import torch
+import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import csr_matrix
 
@@ -31,7 +33,7 @@ def get_combined_record_string(name: str, address: str, country: str) -> str:
 
 
 class TFIDFBlocker:
-    """TF-IDF Character N-Gram similarity blocker with dual GPU (PyTorch CUDA) acceleration."""
+    """TF-IDF Character N-Gram similarity blocker with chunked processing and fast sparse candidate retrieval."""
 
     def __init__(self, top_k: int = 30, ngram_range: Tuple[int, int] = (3, 3), device: str = "cuda:0", max_features: int = 100000):
         self.top_k = top_k
@@ -44,80 +46,85 @@ class TFIDFBlocker:
             dtype=np.float32
         )
 
-    def fit_transform_target(self, target_texts: List[str], vocab_sample_size: int = 200_000) -> csr_matrix:
-        """Fit vocab on a sample, then transform ALL records. 25x faster than fitting on all records."""
+    def fit_transform_target(self, target_texts: List[str], vocab_sample_size: int = 200_000, batch_size: int = 500_000) -> csr_matrix:
+        """Fit vocab on a sample, then transform ALL records in batches with live progress updates."""
         if len(target_texts) > vocab_sample_size:
             import random
             sample_idx = random.sample(range(len(target_texts)), vocab_sample_size)
             sample_texts = [target_texts[i] for i in sample_idx]
-            print(f"  Fitting vocab on {vocab_sample_size:,} sample records (out of {len(target_texts):,})...")
+            print(f"  Fitting vocab on {vocab_sample_size:,} sample records (out of {len(target_texts):,})...", flush=True)
             self.vectorizer.fit(sample_texts)
-            print(f"  Transforming all {len(target_texts):,} records...")
-            return self.vectorizer.transform(target_texts)
+            
+            n_batches = (len(target_texts) + batch_size - 1) // batch_size
+            print(f"  Transforming {len(target_texts):,} records across {n_batches} batches...", flush=True)
+            matrices = []
+            for b_idx in range(n_batches):
+                start_i = b_idx * batch_size
+                end_i = min((b_idx + 1) * batch_size, len(target_texts))
+                batch_texts = target_texts[start_i:end_i]
+                t0 = time.time()
+                mat_b = self.vectorizer.transform(batch_texts)
+                dt = time.time() - t0
+                matrices.append(mat_b)
+                print(f"    Batch {b_idx + 1}/{n_batches} ({start_i:,}..{end_i:,}) transformed in {dt:.1f}s", flush=True)
+            
+            print("  Combining target sparse matrices...", flush=True)
+            return csr_matrix(sp.vstack(matrices, format="csr"))
         else:
-            print(f"  Fitting & transforming {len(target_texts):,} records...")
+            print(f"  Fitting & transforming {len(target_texts):,} records...", flush=True)
             return self.vectorizer.fit_transform(target_texts)
 
     def retrieve_candidates(
         self,
         s1_texts: List[str],
         target_matrix: csr_matrix,
-        top_k: Optional[int] = None
+        top_k: Optional[int] = None,
+        query_batch_size: int = 50_000
     ) -> List[List[int]]:
-        """Retrieve top-K nearest indices for each Source 1 record using PyTorch CUDA GPU tensor operations."""
+        """Retrieve top-K nearest indices for each Source 1 record using fast sparse matrix dot product."""
         k = top_k or self.top_k
-        print(f"  Transforming {len(s1_texts)} Source 1 records to TF-IDF sparse matrix...")
+        print(f"  Transforming {len(s1_texts):,} Source 1 query records...", flush=True)
         s1_matrix = self.vectorizer.transform(s1_texts)
 
-        if torch.cuda.is_available() and self.device.startswith("cuda"):
-            try:
-                device_id = int(self.device.split(":")[-1]) if ":" in self.device else 0
-                device_obj = torch.device(f"cuda:{device_id}")
-                print(f"⚡ Moving Sparse Matrices to GPU ({device_obj}) VRAM...")
-
-                # Convert target matrix to PyTorch CUDA sparse COO tensor
-                t_coo = target_matrix.tocoo()
-                t_idx = torch.from_numpy(np.vstack((t_coo.row, t_coo.col))).to(torch.int64).to(device_obj)
-                t_val = torch.from_numpy(t_coo.data).to(torch.float32).to(device_obj)
-                t_gpu = torch.sparse_coo_tensor(t_idx, t_val, torch.Size(t_coo.shape), device=device_obj).coalesce()
-                t_gpu_T = torch.sparse_coo_tensor(
-                    torch.stack([t_idx[1], t_idx[0]]), t_val, torch.Size((t_coo.shape[1], t_coo.shape[0])), device=device_obj
-                ).coalesce()
-
-                # Convert s1 matrix to PyTorch CUDA sparse tensor
-                s1_coo = s1_matrix.tocoo()
-                s1_idx = torch.from_numpy(np.vstack((s1_coo.row, s1_coo.col))).to(torch.int64).to(device_obj)
-                s1_val = torch.from_numpy(s1_coo.data).to(torch.float32).to(device_obj)
-                s1_gpu = torch.sparse_coo_tensor(s1_idx, s1_val, torch.Size(s1_coo.shape), device=device_obj).coalesce()
-
-                print(f"🔥 Executing PyTorch Sparse Cosine Similarity on GPU ({device_obj})...")
-                # PyTorch GPU Sparse Matrix Multiplication
-                sim_gpu = torch.sparse.mm(s1_gpu, t_gpu_T).to_dense()
-
-                print(f"🎯 Extracting Top-{k} Candidates on GPU ({device_obj})...")
-                top_vals, top_indices = torch.topk(sim_gpu, k=min(k, sim_gpu.shape[1]), dim=1)
-                
-                candidates_per_row = top_indices.cpu().numpy().tolist()
-                return candidates_per_row
-            except Exception as e:
-                print(f"⚠️ PyTorch GPU execution fallback to CPU due to: {e}")
-
-        # CPU Fallback
-        print(f"  Calculating sparse matrix dot product on CPU ({s1_matrix.shape[0]} x {target_matrix.shape[0]})...")
-        sim_matrix = s1_matrix.dot(target_matrix.T)
+        print(f"  Computing sparse dot product ({s1_matrix.shape[0]:,} x {target_matrix.shape[0]:,})...", flush=True)
         
         candidates_per_row = []
-        for i in range(sim_matrix.shape[0]):
-            row = sim_matrix.getrow(i)
-            if row.nnz == 0:
-                candidates_per_row.append([])
-                continue
-            if row.nnz <= k:
-                top_indices = row.indices[np.argsort(row.data)[::-1]]
-            else:
-                top_indices = row.indices[np.argsort(row.data)[-k:][::-1]]
-            candidates_per_row.append(top_indices.tolist())
+        n_queries = s1_matrix.shape[0]
+        n_batches = (n_queries + query_batch_size - 1) // query_batch_size
+
+        target_matrix_T = target_matrix.T.tocsc()
+
+        for b in range(n_batches):
+            q_start = b * query_batch_size
+            q_end = min((b + 1) * query_batch_size, n_queries)
+            s1_sub = s1_matrix[q_start:q_end]
             
+            t0 = time.time()
+            sim_sub = s1_sub.dot(target_matrix_T)
+            
+            # Fast vectorized top-k extraction per row from indptr/indices/data arrays
+            indptr = sim_sub.indptr
+            indices = sim_sub.indices
+            data = sim_sub.data
+
+            for i in range(sim_sub.shape[0]):
+                s, e = indptr[i], indptr[i+1]
+                n = e - s
+                if n == 0:
+                    candidates_per_row.append([])
+                    continue
+                r_data, r_ind = data[s:e], indices[s:e]
+                if n <= k:
+                    candidates_per_row.append(r_ind[np.argsort(r_data)[::-1]].tolist())
+                else:
+                    sub = np.argpartition(r_data, -k)[-k:]
+                    sub = sub[np.argsort(r_data[sub])[::-1]]
+                    candidates_per_row.append(r_ind[sub].tolist())
+            
+            dt = time.time() - t0
+            if n_batches > 1:
+                print(f"    Query batch {b+1}/{n_batches} processed in {dt:.1f}s", flush=True)
+
         return candidates_per_row
 
 
@@ -135,8 +142,8 @@ def generate_candidate_pairs(
     df_s3: pd.DataFrame,
     top_k_per_source: int = 25
 ) -> pd.DataFrame:
-    """Generate candidate entity pairs for each Source 1 record using dual GPUs."""
-    print("Preparing record text representations...")
+    """Generate candidate entity pairs for each Source 1 record using fast TF-IDF blocking."""
+    print("Preparing record text representations...", flush=True)
     s1_texts = get_combined_record_strings_vectorized(df_s1)
     s2_texts = get_combined_record_strings_vectorized(df_s2)
     s3_texts = get_combined_record_strings_vectorized(df_s3)
@@ -144,22 +151,21 @@ def generate_candidate_pairs(
     s2_ids = df_s2["entity_id"].tolist()
     s3_ids = df_s3["entity_id"].tolist()
 
-    # Use cuda:0 for Source 2, cuda:1 for Source 3 (Dual GPU distribution)
     dev_s2 = "cuda:0" if torch.cuda.is_available() else "cpu"
     dev_s3 = "cuda:1" if torch.cuda.device_count() > 1 else dev_s2
 
     blocker_s2 = TFIDFBlocker(top_k=top_k_per_source, device=dev_s2)
-    print(f"Fitting S2 vectorizer & retrieving candidates on {dev_s2}...")
+    print(f"Fitting S2 vectorizer & retrieving candidates on {dev_s2}...", flush=True)
     mat_s2 = blocker_s2.fit_transform_target(s2_texts)
     cands_s2 = blocker_s2.retrieve_candidates(s1_texts, mat_s2)
 
     blocker_s3 = TFIDFBlocker(top_k=top_k_per_source, device=dev_s3)
-    print(f"Fitting S3 vectorizer & retrieving candidates on {dev_s3}...")
+    print(f"Fitting S3 vectorizer & retrieving candidates on {dev_s3}...", flush=True)
     mat_s3 = blocker_s3.fit_transform_target(s3_texts)
     cands_s3 = blocker_s3.retrieve_candidates(s1_texts, mat_s3)
 
     results = []
-    print("Formatting candidate results...")
+    print("Formatting candidate results...", flush=True)
     for idx, s1_id in enumerate(df_s1["entity_id"].tolist()):
         matched_cands = set()
         for s2_idx in cands_s2[idx]:
@@ -173,4 +179,3 @@ def generate_candidate_pairs(
         })
 
     return pd.DataFrame(results)
-
