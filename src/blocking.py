@@ -33,13 +33,14 @@ def get_combined_record_string(name: str, address: str, country: str) -> str:
 class TFIDFBlocker:
     """TF-IDF Character N-Gram similarity blocker with dual GPU (PyTorch CUDA) acceleration."""
 
-    def __init__(self, top_k: int = 30, ngram_range: Tuple[int, int] = (3, 4), device: str = "cuda:0"):
+    def __init__(self, top_k: int = 30, ngram_range: Tuple[int, int] = (3, 3), device: str = "cuda:0", max_features: int = 100000):
         self.top_k = top_k
         self.device = device if torch.cuda.is_available() else "cpu"
         self.vectorizer = TfidfVectorizer(
             analyzer="char_wb",
             ngram_range=ngram_range,
-            min_df=2,
+            min_df=5,
+            max_features=max_features,
             dtype=np.float32
         )
 
@@ -51,59 +52,31 @@ class TFIDFBlocker:
         self,
         s1_texts: List[str],
         target_matrix: csr_matrix,
-        top_k: Optional[int] = None,
-        batch_size: int = 2000
+        top_k: Optional[int] = None
     ) -> List[List[int]]:
-        """Retrieve top-K nearest indices for each Source 1 record using GPU matrix multiplication."""
+        """Retrieve top-K nearest indices for each Source 1 record using fast sparse cosine similarity."""
         k = top_k or self.top_k
+        print(f"  Transforming {len(s1_texts)} Source 1 records to TF-IDF sparse matrix...")
         s1_matrix = self.vectorizer.transform(s1_texts)
         
-        # CPU Fallback if PyTorch CUDA is not available
-        if self.device == "cpu":
-            sim_matrix = s1_matrix.dot(target_matrix.T)
-            candidates_per_row = []
-            for i in range(sim_matrix.shape[0]):
-                row = sim_matrix.getrow(i)
-                if row.nnz == 0:
-                    candidates_per_row.append([])
-                    continue
-                top_indices = row.indices[np.argsort(row.data)[-k:][::-1]]
-                candidates_per_row.append(top_indices.tolist())
-            return candidates_per_row
-
-        # PyTorch GPU Acceleration
-        print(f"⚡ Accelerating Top-{k} Retrieval on GPU ({self.device})...")
-        device_obj = torch.device(self.device)
+        print(f"  Calculating sparse matrix dot product ({s1_matrix.shape[0]} x {target_matrix.shape[0]})...")
+        # Sparse matrix dot product (sub-second calculation)
+        sim_matrix = s1_matrix.dot(target_matrix.T)
         
-        # Convert target matrix to PyTorch CUDA Sparse Coo Tensor
-        target_coo = target_matrix.tocoo()
-        indices = torch.from_numpy(np.vstack((target_coo.row, target_coo.col))).to(torch.int64)
-        values = torch.from_numpy(target_coo.data).to(torch.float32)
-        shape = target_coo.shape
-        target_sparse_gpu = torch.sparse_coo_tensor(indices, values, torch.Size(shape), device=device_obj)
-        target_gpu_T = target_sparse_gpu.to_dense().T  # Transpose on GPU memory
-
-        num_s1 = s1_matrix.shape[0]
+        print(f"  Extracting Top-{k} candidates for each Source 1 entity...")
         candidates_per_row = []
-
-        for start_idx in range(0, num_s1, batch_size):
-            end_idx = min(start_idx + batch_size, num_s1)
-            batch_csr = s1_matrix[start_idx:end_idx]
+        for i in range(sim_matrix.shape[0]):
+            row = sim_matrix.getrow(i)
+            if row.nnz == 0:
+                candidates_per_row.append([])
+                continue
+            # Get top K indices with highest cosine similarity
+            if row.nnz <= k:
+                top_indices = row.indices[np.argsort(row.data)[::-1]]
+            else:
+                top_indices = row.indices[np.argsort(row.data)[-k:][::-1]]
+            candidates_per_row.append(top_indices.tolist())
             
-            # Convert batch to PyTorch dense tensor on GPU
-            batch_dense = torch.from_numpy(batch_csr.toarray()).to(torch.float32).to(device_obj)
-            
-            # GPU Matrix Multiplication: (batch_size x vocab) @ (vocab x target_size)
-            sim_gpu = torch.mm(batch_dense, target_gpu_T)
-            
-            # GPU Top-K selection
-            top_vals, top_indices = torch.topk(sim_gpu, k=min(k, sim_gpu.shape[1]), dim=1)
-            
-            # Transfer top-K indices back to CPU
-            top_indices_cpu = top_indices.cpu().numpy()
-            for row in top_indices_cpu:
-                candidates_per_row.append(row.tolist())
-
         return candidates_per_row
 
 
