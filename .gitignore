@@ -1,0 +1,21 @@
+# Data & Datasets
+dataset/
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+
+# Python Cache & Compiled Files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# System Files
+.DS_Store
+Thumbs.db
