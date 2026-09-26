@@ -152,10 +152,10 @@ class TFIDFBlocker:
         batch_size: int = 500_000,
     ) -> csr_matrix:
         """Fit vocab on S1+target combined, transform all target records in batches."""
-        import random
         target_sample_n = max(0, vocab_sample_size - len(query_texts))
+        rng = np.random.default_rng(42)
         target_sample = (
-            [target_texts[i] for i in random.sample(range(len(target_texts)), target_sample_n)]
+            [target_texts[i] for i in rng.choice(len(target_texts), size=target_sample_n, replace=False)]
             if len(target_texts) > target_sample_n else target_texts
         )
         fit_texts = list(query_texts) + target_sample
@@ -239,13 +239,26 @@ class TFIDFBlocker:
                             bpos = np.argpartition(sim_dense, -local_k, axis=1)[:, -local_k:]
                             bscores = sim_dense[np.arange(sim_dense.shape[0])[:, None], bpos]
                             bcols   = (bpos + c_start).astype(np.int32)
-                            chunk_scores.extend([bscores[r] for r in range(bscores.shape[0])])
-                            chunk_cols.extend([bcols[r]   for r in range(bcols.shape[0])])
+                            # Filter zero-score candidates (empty/zero-vector S1 rows
+                            # get arbitrary indices from argpartition — pure noise)
+                            for r in range(bscores.shape[0]):
+                                mask = bscores[r] > 0
+                                chunk_scores.append(bscores[r][mask].astype(np.float32))
+                                chunk_cols.append(bcols[r][mask].astype(np.int32))
                         del chunk_gpu
                         cp.get_default_memory_pool().free_all_blocks()
                         label = f"GPU ({self.device})"
                 except Exception as ex:
                     print(f"  ⚠️ GPU chunk failed: {ex} — CPU fallback.", flush=True)
+                    # Clean up any GPU memory from partial execution
+                    try:
+                        del chunk_gpu
+                    except NameError:
+                        pass
+                    try:
+                        cp.get_default_memory_pool().free_all_blocks()
+                    except Exception:
+                        pass
                     sim_sparse = s1_matrix.dot(chunk.T).tocsr()
                     chunk_scores, chunk_cols = _topk_from_sparse(sim_sparse, k, c_start)
                     label = "CPU"
