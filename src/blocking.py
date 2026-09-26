@@ -107,6 +107,14 @@ class TFIDFBlocker:
         return candidates_per_row
 
 
+def get_combined_record_strings_vectorized(df: pd.DataFrame) -> List[str]:
+    """Fast vectorized text preparation for large DataFrames."""
+    names = df["business_name"].fillna("").astype(str).str.lower()
+    addrs = df["business_address"].fillna("").astype(str).str.lower()
+    countries = df["country"].fillna("").astype(str).str.lower()
+    return (names + " " + addrs + " " + countries).tolist()
+
+
 def generate_candidate_pairs(
     df_s1: pd.DataFrame,
     df_s2: pd.DataFrame,
@@ -115,18 +123,9 @@ def generate_candidate_pairs(
 ) -> pd.DataFrame:
     """Generate candidate entity pairs for each Source 1 record using dual GPUs."""
     print("Preparing record text representations...")
-    s1_texts = [
-        get_combined_record_string(r.get("business_name", ""), r.get("business_address", ""), r.get("country", ""))
-        for _, r in df_s1.iterrows()
-    ]
-    s2_texts = [
-        get_combined_record_string(r.get("business_name", ""), r.get("business_address", ""), r.get("country", ""))
-        for _, r in df_s2.iterrows()
-    ]
-    s3_texts = [
-        get_combined_record_string(r.get("business_name", ""), r.get("business_address", ""), r.get("country", ""))
-        for _, r in df_s3.iterrows()
-    ]
+    s1_texts = get_combined_record_strings_vectorized(df_s1)
+    s2_texts = get_combined_record_strings_vectorized(df_s2)
+    s3_texts = get_combined_record_strings_vectorized(df_s3)
 
     s2_ids = df_s2["entity_id"].tolist()
     s3_ids = df_s3["entity_id"].tolist()
