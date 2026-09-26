@@ -44,9 +44,19 @@ class TFIDFBlocker:
             dtype=np.float32
         )
 
-    def fit_transform_target(self, target_texts: List[str]) -> csr_matrix:
-        """Fit and transform candidate pool (Source 2 or Source 3)."""
-        return self.vectorizer.fit_transform(target_texts)
+    def fit_transform_target(self, target_texts: List[str], vocab_sample_size: int = 200_000) -> csr_matrix:
+        """Fit vocab on a sample, then transform ALL records. 25x faster than fitting on all records."""
+        if len(target_texts) > vocab_sample_size:
+            import random
+            sample_idx = random.sample(range(len(target_texts)), vocab_sample_size)
+            sample_texts = [target_texts[i] for i in sample_idx]
+            print(f"  Fitting vocab on {vocab_sample_size:,} sample records (out of {len(target_texts):,})...")
+            self.vectorizer.fit(sample_texts)
+            print(f"  Transforming all {len(target_texts):,} records...")
+            return self.vectorizer.transform(target_texts)
+        else:
+            print(f"  Fitting & transforming {len(target_texts):,} records...")
+            return self.vectorizer.fit_transform(target_texts)
 
     def retrieve_candidates(
         self,
