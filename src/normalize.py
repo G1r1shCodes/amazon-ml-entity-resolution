@@ -11,7 +11,7 @@ from typing import Tuple
 
 # Legal terms and suffixes to strip/standardize
 LEGAL_PATTERNS = [
-    (r"\b(d\.?b\.?a\.?|doing business as)\b.*", ""),  # Strip DBA clauses
+    (r"\b(d\.?b\.?a\.?|doing business as|d/b/a)\b", " "),  # Remove DBA marker, keep trade name!
     (r"\b(private limited|pvt ltd|pvt\.? ltd\.?)\b", "pvt_ltd"),
     (r"\b(limited liability company|l\.?l\.?c\.?|llc)\b", "llc"),
     (r"\b(limited liability partnership|l\.?l\.?p\.?|llp)\b", "llp"),
