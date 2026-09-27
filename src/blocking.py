@@ -276,7 +276,8 @@ class TFIDFBlocker:
                         cp.get_default_memory_pool().free_all_blocks()
                         label = f"GPU ({self.device})"
                 except Exception as ex:
-                    print(f"  ⚠️ GPU chunk failed: {ex} — CPU fallback.", flush=True)
+                    print(f"  ⚠️ GPU chunk failed: {ex} — switching remaining chunks to CPU fallback.", flush=True)
+                    use_gpu = False
                     # Clean up any GPU memory from partial execution
                     try:
                         del chunk_gpu
