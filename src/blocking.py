@@ -235,19 +235,13 @@ class TFIDFBlocker:
                         chunk_scores, chunk_cols = [], []
                         for qb in range(0, n_queries, gpu_query_batch):
                             s1_sub_gpu = s1_gpu[qb: qb + gpu_query_batch]
-                            # Dense similarity stays ON GPU — only per-query top-k crosses PCIe
-                            # (transfers ~50KB per batch instead of a 200MB dense block)
-                            sim_gpu = (s1_sub_gpu @ chunk_gpu.T).toarray()
-                            local_k = min(k, sim_gpu.shape[1])
-                            bpos_gpu = cp.argpartition(sim_gpu, -local_k, axis=1)[:, -local_k:]
-                            bscores_gpu = cp.take_along_axis(sim_gpu, bpos_gpu, axis=1)
-                            order_gpu = cp.argsort(-bscores_gpu, axis=1)
-                            bpos_gpu = cp.take_along_axis(bpos_gpu, order_gpu, axis=1)
-                            bscores_gpu = cp.take_along_axis(bscores_gpu, order_gpu, axis=1)
-                            del sim_gpu, order_gpu
-                            bscores = cp.asnumpy(bscores_gpu)
-                            bcols = cp.asnumpy(bpos_gpu).astype(np.int32) + c_start
-                            del bscores_gpu, bpos_gpu
+                            # GPU sparse matmul → transfer dense to CPU → numpy argpartition
+                            # (numpy argpartition is 28x faster than cupy's for 500×100k arrays)
+                            sim_dense = cp.asnumpy((s1_sub_gpu @ chunk_gpu.T).toarray())
+                            local_k = min(k, sim_dense.shape[1])
+                            bpos = np.argpartition(sim_dense, -local_k, axis=1)[:, -local_k:]
+                            bscores = sim_dense[np.arange(sim_dense.shape[0])[:, None], bpos]
+                            bcols = (bpos + c_start).astype(np.int32)
                             # Filter zero-score candidates (empty/zero-vector S1 rows
                             # get arbitrary indices from argpartition — pure noise)
                             for r in range(bscores.shape[0]):
