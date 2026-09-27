@@ -46,6 +46,30 @@ def _normalize_text_fast(text: str) -> str:
     return text
 
 
+def generate_blocking_keys(name: str, address: str, country: str) -> List[str]:
+    """Generate blocking index keys for a record.
+
+    Example blocking keys:
+    - Country + First 3 chars of normalized name
+    - Country + First token of normalized name
+    - Country + Longest distinctive token (>= 4 chars)
+    """
+    norm_name = clean_text(str(name))
+    tokens = norm_name.split()
+
+    keys = []
+    if norm_name and country:
+        country_str = str(country).strip()
+        keys.append(f"{country_str}_{norm_name[:3]}")
+        if tokens:
+            keys.append(f"{country_str}_{tokens[0]}")
+        if len(tokens) > 1:
+            longest = max(tokens, key=len)
+            if len(longest) >= 4:
+                keys.append(f"{country_str}_{longest}")
+    return keys
+
+
 def get_record_texts(df: pd.DataFrame) -> List[str]:
     """Combine business name + address into a single normalized string.
 

@@ -59,29 +59,63 @@ def _safe_len_ratio(a: str, b: str) -> float:
     return min(la, lb) / max(la, lb)
 
 
-def compute_pair_features(name1: str, name2: str,
-                          addr1: str, addr2: str,
-                          country1: str, country2: str) -> np.ndarray:
-    """Compute feature vector for a single S1-candidate pair.
+def compute_pair_features(
+    name1: any,
+    name2: any,
+    addr1: str = "",
+    addr2: str = "",
+    country1: str = "",
+    country2: str = "",
+) -> np.ndarray:
+    """Compute feature vector for a single S1-candidate pair. Supports dict inputs as well."""
+    if isinstance(name1, dict):
+        rec1 = name1
+        rec2 = name2
+        n1_raw = str(rec1.get("business_name", ""))
+        n2_raw = str(rec2.get("business_name", ""))
+        a1_raw = str(rec1.get("business_address", ""))
+        a2_raw = str(rec2.get("business_address", ""))
+        country1 = str(rec1.get("country", ""))
+        country2 = str(rec2.get("country", ""))
+        n1_clean = rec1.get("norm_name") or normalize_business_name(n1_raw)[0]
+        n2_clean = rec2.get("norm_name") or normalize_business_name(n2_raw)[0]
+        a1_clean = rec1.get("norm_addr") or normalize_address(a1_raw)
+        a2_clean = rec2.get("norm_addr") or normalize_address(a2_raw)
+        n1_set = rec1.get("name_token_set_pre")
+        n2_set = rec2.get("name_token_set_pre")
+        if n1_set is not None and n2_set is not None:
+            u1 = len(n1_set | n2_set)
+            name_jac = float(len(n1_set & n2_set) / u1) if u1 > 0 else 0.0
+        else:
+            name_jac = jaccard_similarity(n1_raw, n2_raw)
 
-    Returns a 1D numpy array with len(FEATURE_NAMES) values.
-    """
-    # Normalize names (returns tuple: cleaned_name, legal_suffix)
-    n1_clean, _ = normalize_business_name(name1)
-    n2_clean, _ = normalize_business_name(name2)
-    a1_clean = normalize_address(addr1)
-    a2_clean = normalize_address(addr2)
+        a1_set = rec1.get("addr_token_set_pre")
+        a2_set = rec2.get("addr_token_set_pre")
+        if a1_set is not None and a2_set is not None:
+            u2 = len(a1_set | a2_set)
+            addr_jac = float(len(a1_set & a2_set) / u2) if u2 > 0 else 0.0
+        else:
+            addr_jac = jaccard_similarity(a1_raw, a2_raw)
+    else:
+        name1 = str(name1)
+        name2 = str(name2)
+        n1_clean, _ = normalize_business_name(name1)
+        n2_clean, _ = normalize_business_name(name2)
+        a1_clean = normalize_address(addr1)
+        a2_clean = normalize_address(addr2)
+        name_jac = jaccard_similarity(name1, name2)
+        addr_jac = jaccard_similarity(addr1, addr2)
 
     return np.array([
-        jaccard_similarity(name1, name2),
+        name_jac,
         fuzz.ratio(n1_clean, n2_clean) / 100.0,
         fuzz.partial_ratio(n1_clean, n2_clean) / 100.0,
         fuzz.token_sort_ratio(n1_clean, n2_clean) / 100.0,
         fuzz.token_set_ratio(n1_clean, n2_clean) / 100.0,
-        jaccard_similarity(addr1, addr2),
+        addr_jac,
         fuzz.ratio(a1_clean, a2_clean) / 100.0,
         fuzz.partial_ratio(a1_clean, a2_clean) / 100.0,
-        1.0 if country1.lower() == country2.lower() and country1.strip() != "" else 0.0,
+        1.0 if str(country1).lower() == str(country2).lower() and str(country1).strip() != "" else 0.0,
         _safe_len_ratio(n1_clean, n2_clean),
         _safe_len_ratio(a1_clean, a2_clean),
     ], dtype=np.float32)
