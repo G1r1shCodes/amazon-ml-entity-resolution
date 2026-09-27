@@ -7,7 +7,8 @@ Key design decisions:
 - Word n-gram TF-IDF (1,2): word token overlap >> char 3-gram at 5M scale
 - Vocab fitted on S1 + target sample: prevents S1 terms being OOV
 - Sparse-result top-k extraction: NO .toarray() on full result — avoids 4GB RAM spikes
-- Parallel dual-GPU: S2 on cuda:0 and S3 on cuda:1 via threading (CuPy releases GIL)
+- Sequential dual-GPU (default): S2 on cuda:0, then S3 on cuda:1 — parallel mode exists
+  but vectorizing 10M texts concurrently exceeds Kaggle's 13GB RAM (causes kernel restarts)
 """
 
 import time
@@ -187,7 +188,8 @@ class TFIDFBlocker:
         """Retrieve top-K candidates.
 
         CPU path: sparse dot product → top-k extracted from sparse CSR rows (no dense alloc).
-        GPU path: query batches of `gpu_query_batch` × chunks → small dense (500×100k=200MB).
+        GPU path: dense similarity kept on GPU; only per-query top-k values+indices cross
+        PCIe (~50KB/batch). Zero-score candidates (empty/zero-vector S1 rows) are filtered.
         """
         k = top_k or self.top_k
         n_queries = len(s1_texts)
@@ -233,12 +235,19 @@ class TFIDFBlocker:
                         chunk_scores, chunk_cols = [], []
                         for qb in range(0, n_queries, gpu_query_batch):
                             s1_sub_gpu = s1_gpu[qb: qb + gpu_query_batch]
-                            sim_dense = cp.asnumpy((s1_sub_gpu @ chunk_gpu.T).toarray())
-                            # top-k from this dense block
-                            local_k = min(k, sim_dense.shape[1])
-                            bpos = np.argpartition(sim_dense, -local_k, axis=1)[:, -local_k:]
-                            bscores = sim_dense[np.arange(sim_dense.shape[0])[:, None], bpos]
-                            bcols   = (bpos + c_start).astype(np.int32)
+                            # Dense similarity stays ON GPU — only per-query top-k crosses PCIe
+                            # (transfers ~50KB per batch instead of a 200MB dense block)
+                            sim_gpu = (s1_sub_gpu @ chunk_gpu.T).toarray()
+                            local_k = min(k, sim_gpu.shape[1])
+                            bpos_gpu = cp.argpartition(sim_gpu, -local_k, axis=1)[:, -local_k:]
+                            bscores_gpu = cp.take_along_axis(sim_gpu, bpos_gpu, axis=1)
+                            order_gpu = cp.argsort(-bscores_gpu, axis=1)
+                            bpos_gpu = cp.take_along_axis(bpos_gpu, order_gpu, axis=1)
+                            bscores_gpu = cp.take_along_axis(bscores_gpu, order_gpu, axis=1)
+                            del sim_gpu, order_gpu
+                            bscores = cp.asnumpy(bscores_gpu)
+                            bcols = cp.asnumpy(bpos_gpu).astype(np.int32) + c_start
+                            del bscores_gpu, bpos_gpu
                             # Filter zero-score candidates (empty/zero-vector S1 rows
                             # get arbitrary indices from argpartition — pure noise)
                             for r in range(bscores.shape[0]):
