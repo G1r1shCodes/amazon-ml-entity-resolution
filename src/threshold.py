@@ -9,6 +9,10 @@ threshold that maximizes the official Macro F0.5 score on validation data.
 import argparse
 import os
 import sys
+
+# Ensure project root is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 from typing import Dict, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd

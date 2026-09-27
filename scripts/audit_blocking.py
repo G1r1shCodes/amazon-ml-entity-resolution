@@ -3,7 +3,13 @@
 Evaluates Person 1's blocking recall ceiling on validation data.
 """
 
+import os
+import sys
 import time
+
+# Ensure project root is in sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
 import pandas as pd
 from src.blocking import generate_blocking_keys
 from src.evaluate import load_mapping_from_tsv, compute_candidate_recall
