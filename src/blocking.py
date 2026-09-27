@@ -4,11 +4,13 @@ Assigned to: Person 1 (blocking & candidate generation)
 Calculates candidate pairs from Source 2 and Source 3 for each Source 1 entity.
 
 Key design decisions:
-- Word n-gram TF-IDF (1,2): word token overlap >> char 3-gram at 5M scale
+- Dual-pass TF-IDF: word (1,2)-gram + char (2,4)-gram union for max recall
+- Word pass: catches exact/near-exact business name matches
+- Char pass: catches typos, glued domains, partial word overlap
+- Name + address text: captures Indic-name pairs sharing Latin addresses
+- max_df=0.5: filters ultra-common tokens → sparser matmul → faster chunks
 - Vocab fitted on S1 + target sample: prevents S1 terms being OOV
-- Sparse-result top-k extraction: NO .toarray() on full result — avoids 4GB RAM spikes
-- Sequential dual-GPU (default): S2 on cuda:0, then S3 on cuda:1 — parallel mode exists
-  but vectorizing 10M texts concurrently exceeds Kaggle's 13GB RAM (causes kernel restarts)
+- Sequential dual-GPU (default): S2 then S3 to stay under Kaggle 13GB RAM
 """
 
 import time
@@ -29,24 +31,31 @@ from src.normalize import normalize_address, normalize_business_name, clean_text
 # Text preparation
 # ---------------------------------------------------------------------------
 
-def _normalize_name_fast(name: str) -> str:
-    """Lowercase + accent strip + remove legal suffixes for vectorized use."""
+def _normalize_text_fast(text: str) -> str:
+    """Lowercase + accent strip + remove legal suffixes + punctuation cleanup."""
     import unicodedata, re
-    name = unicodedata.normalize("NFKD", str(name))
-    name = "".join(c for c in name if not unicodedata.combining(c))
-    name = name.lower()
-    name = re.sub(
+    text = unicodedata.normalize("NFKD", str(text))
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = text.lower()
+    text = re.sub(
         r'\b(llc|ltd|inc|corp|co|plc|gmbh|llp|lp|sa|srl|sl|bv|nv|ag|oy|ab|as|pte|pvt|sas|kk|kg)\b\.?',
-        '', name
+        '', text
     )
-    name = re.sub(r'[^\w\s]', ' ', name)
-    name = re.sub(r'\s+', ' ', name).strip()
-    return name
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
 
 
-def get_combined_record_strings_vectorized(df: pd.DataFrame) -> List[str]:
-    """Normalize business names for TF-IDF blocking (name-only — address is noisy/empty)."""
-    return df["business_name"].fillna("").astype(str).apply(_normalize_name_fast).tolist()
+def get_record_texts(df: pd.DataFrame) -> List[str]:
+    """Combine business name + address into a single normalized string.
+
+    Including address captures Indic-name pairs that share Latin addresses
+    (e.g. Tamil S2 name + '6(29), C.I.T. COLONY' matches Latin S1 with same address).
+    """
+    names = df["business_name"].fillna("").astype(str)
+    addrs = df["business_address"].fillna("").astype(str)
+    combined = (names + " " + addrs).apply(_normalize_text_fast)
+    return combined.tolist()
 
 
 # ---------------------------------------------------------------------------
@@ -129,17 +138,21 @@ def _merge_topk_lists(
 # ---------------------------------------------------------------------------
 
 class TFIDFBlocker:
-    """Word n-gram TF-IDF blocker with GPU sparse matmul and zero-copy top-k."""
+    """TF-IDF blocker with configurable analyzer, GPU sparse matmul, and zero-copy top-k."""
 
     def __init__(self, top_k: int = 50, device: str = "cuda:0",
-                 max_features: int = 150_000):
+                 max_features: int = 150_000,
+                 analyzer: str = "word", ngram_range: Tuple[int, int] = (1, 2),
+                 max_df: float = 0.5):
         self.top_k = top_k
         self.device = device
         self.device_id = int(device.split(":")[-1]) if "cuda:" in device else 0
+        self.analyzer = analyzer
         self.vectorizer = TfidfVectorizer(
-            analyzer="word",
-            ngram_range=(1, 2),
+            analyzer=analyzer,
+            ngram_range=ngram_range,
             min_df=2,
+            max_df=max_df,
             max_features=max_features,
             dtype=np.float32,
             sublinear_tf=True,
@@ -312,85 +325,126 @@ def _blocking_worker(
         result_q.put((name, None, ex))
 
 
+def _run_single_pass(
+    pass_name: str,
+    s1_texts: List[str],
+    target_texts: List[str],
+    top_k: int,
+    device: str,
+    analyzer: str = "word",
+    ngram_range: Tuple[int, int] = (1, 2),
+    max_df: float = 0.5,
+    max_features: int = 150_000,
+) -> List[List[int]]:
+    """Run a single TF-IDF blocking pass with the given analyzer config."""
+    import gc
+    print(f"\n  📌 {pass_name} pass (analyzer={analyzer}, ngram={ngram_range}, max_df={max_df})...",
+          flush=True)
+    blocker = TFIDFBlocker(
+        top_k=top_k, device=device,
+        max_features=max_features,
+        analyzer=analyzer, ngram_range=ngram_range, max_df=max_df,
+    )
+    mat = blocker.fit_transform_target(target_texts, query_texts=s1_texts)
+    cands = blocker.retrieve_candidates(s1_texts, mat)
+    del mat, blocker
+    gc.collect()
+    return cands
+
+
+def _merge_candidate_indices(
+    cands_a: List[List[int]],
+    cands_b: List[List[int]],
+) -> List[List[int]]:
+    """Union two candidate index lists (per-query)."""
+    merged = []
+    for a, b in zip(cands_a, cands_b):
+        merged.append(list(set(a) | set(b)))
+    return merged
+
+
 def generate_candidate_pairs(
     df_s1: pd.DataFrame,
     df_s2: pd.DataFrame,
     df_s3: pd.DataFrame,
-    top_k_per_source: int = 50,
-    parallel: bool = False,
+    top_k_per_source: int = 30,
 ) -> pd.DataFrame:
-    """Generate candidate entity pairs using TF-IDF blocking.
+    """Generate candidate entity pairs using dual-pass TF-IDF blocking.
 
-    Sequential mode (`parallel=False`, default) processes S2 then S3 sequentially.
-    When 2 GPUs are available, S2 uses `cuda:0` and S3 uses `cuda:1`.
-    Sequential execution ensures RAM usage stays under ~6GB, preventing Kaggle kernel restarts.
+    Pass 1 — Word (1,2)-gram: catches exact/near-exact business name matches.
+    Pass 2 — Char (2,4)-gram: catches typos, glued domains, partial word overlap.
+    Candidates from both passes are unioned per query.
+
+    Uses name + address text to capture Indic-name pairs sharing Latin addresses.
+    max_df=0.5 filters ultra-common tokens → sparser matmul → faster chunks.
     """
     import gc
-    print("Preparing record text representations...", flush=True)
-    s1_texts = get_combined_record_strings_vectorized(df_s1)
-    s2_texts = get_combined_record_strings_vectorized(df_s2)
-    s3_texts = get_combined_record_strings_vectorized(df_s3)
+    print("Preparing record text representations (name + address)...", flush=True)
+    s1_texts = get_record_texts(df_s1)
+    s2_texts = get_record_texts(df_s2)
+    s3_texts = get_record_texts(df_s3)
 
     s2_ids = df_s2["entity_id"].tolist()
     s3_ids = df_s3["entity_id"].tolist()
 
     dev_s2 = "cuda:0" if torch.cuda.is_available() else "cpu"
     dev_s3 = "cuda:1" if torch.cuda.device_count() > 1 else dev_s2
-    dual_gpu = torch.cuda.device_count() > 1
 
-    if parallel and dual_gpu:
-        print(f"\n🔀 Parallel dual-GPU blocking: S2→{dev_s2}, S3→{dev_s3}", flush=True)
-        result_q: queue.Queue = queue.Queue()
-        t_s2 = threading.Thread(
-            target=_blocking_worker,
-            args=("s2", s1_texts, s2_texts, top_k_per_source, dev_s2, result_q),
-            daemon=True,
-        )
-        t_s3 = threading.Thread(
-            target=_blocking_worker,
-            args=("s3", s1_texts, s3_texts, top_k_per_source, dev_s3, result_q),
-            daemon=True,
-        )
-        t_s2.start()
-        t_s3.start()
-        t_s2.join()
-        t_s3.join()
+    # ── S2 dual-pass blocking ──
+    print(f"\n{'='*60}", flush=True)
+    print(f"── S2 blocking on {dev_s2} (dual-pass) ──", flush=True)
+    print(f"{'='*60}", flush=True)
 
-        cands_s2 = cands_s3 = None
-        for _ in range(2):
-            name, cands, err = result_q.get()
-            if err:
-                raise RuntimeError(f"Blocking worker '{name}' failed: {err}")
-            if name == "s2":
-                cands_s2 = cands
-            else:
-                cands_s3 = cands
-    else:
-        print(f"\n── Processing S2 blocking on {dev_s2} ──", flush=True)
-        blocker_s2 = TFIDFBlocker(top_k=top_k_per_source, device=dev_s2)
-        mat_s2 = blocker_s2.fit_transform_target(s2_texts, query_texts=s1_texts)
-        cands_s2 = blocker_s2.retrieve_candidates(s1_texts, mat_s2)
-        del mat_s2, blocker_s2
-        gc.collect()
+    cands_s2_word = _run_single_pass(
+        "Word n-gram", s1_texts, s2_texts,
+        top_k=top_k_per_source, device=dev_s2,
+        analyzer="word", ngram_range=(1, 2), max_df=0.5, max_features=150_000,
+    )
+    cands_s2_char = _run_single_pass(
+        "Char n-gram", s1_texts, s2_texts,
+        top_k=top_k_per_source, device=dev_s2,
+        analyzer="char_wb", ngram_range=(2, 4), max_df=0.5, max_features=200_000,
+    )
+    cands_s2 = _merge_candidate_indices(cands_s2_word, cands_s2_char)
+    del cands_s2_word, cands_s2_char
+    gc.collect()
 
-        print(f"\n── Processing S3 blocking on {dev_s3} ──", flush=True)
-        blocker_s3 = TFIDFBlocker(top_k=top_k_per_source, device=dev_s3)
-        mat_s3 = blocker_s3.fit_transform_target(s3_texts, query_texts=s1_texts)
-        cands_s3 = blocker_s3.retrieve_candidates(s1_texts, mat_s3)
-        del mat_s3, blocker_s3
-        gc.collect()
+    # ── S3 dual-pass blocking ──
+    print(f"\n{'='*60}", flush=True)
+    print(f"── S3 blocking on {dev_s3} (dual-pass) ──", flush=True)
+    print(f"{'='*60}", flush=True)
 
+    cands_s3_word = _run_single_pass(
+        "Word n-gram", s1_texts, s3_texts,
+        top_k=top_k_per_source, device=dev_s3,
+        analyzer="word", ngram_range=(1, 2), max_df=0.5, max_features=150_000,
+    )
+    cands_s3_char = _run_single_pass(
+        "Char n-gram", s1_texts, s3_texts,
+        top_k=top_k_per_source, device=dev_s3,
+        analyzer="char_wb", ngram_range=(2, 4), max_df=0.5, max_features=200_000,
+    )
+    cands_s3 = _merge_candidate_indices(cands_s3_word, cands_s3_char)
+    del cands_s3_word, cands_s3_char
+    gc.collect()
+
+    # ── Format results ──
     print("\nFormatting candidate results...", flush=True)
     results = []
+    total_cands = 0
     for idx, s1_id in enumerate(df_s1["entity_id"].tolist()):
         matched = set()
         for s2_idx in cands_s2[idx]:
             matched.add(s2_ids[s2_idx])
         for s3_idx in cands_s3[idx]:
             matched.add(s3_ids[s3_idx])
+        total_cands += len(matched)
         results.append({
             "source1_entity_id": s1_id,
             "candidate_entity_ids": ",".join(sorted(matched))
         })
 
+    n_queries = len(df_s1)
+    print(f"✅ {total_cands:,} total candidates for {n_queries:,} queries "
+          f"(avg {total_cands/n_queries:.1f} per query)", flush=True)
     return pd.DataFrame(results)
