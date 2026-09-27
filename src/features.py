@@ -25,9 +25,13 @@ FEATURE_NAMES = [
     "name_partial_ratio",
     "name_token_sort",
     "name_token_set",
+    "name_exact_match",
+    "name_first_token_match",
+    "phonetic_match",
     "addr_jaccard",
     "addr_levenshtein",
     "addr_partial_ratio",
+    "addr_number_match",
     "same_country",
     "name_len_ratio",
     "addr_len_ratio",
@@ -35,7 +39,7 @@ FEATURE_NAMES = [
 
 
 # ---------------------------------------------------------------------------
-# Single-pair feature computation
+# Feature helpers
 # ---------------------------------------------------------------------------
 
 def jaccard_similarity(str1: str, str2: str) -> float:
@@ -59,6 +63,36 @@ def _safe_len_ratio(a: str, b: str) -> float:
     return min(la, lb) / max(la, lb)
 
 
+def _phonetic_match_score(name1: str, name2: str) -> float:
+    """Return 1.0 if Double Metaphone primary/secondary codes overlap, else 0.0."""
+    try:
+        from metaphone import doublemetaphone
+        m1_p, m1_s = doublemetaphone(name1)
+        m2_p, m2_s = doublemetaphone(name2)
+        codes1 = {c for c in (m1_p, m1_s) if c}
+        codes2 = {c for c in (m2_p, m2_s) if c}
+        if codes1 and codes2 and (codes1 & codes2):
+            return 1.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _addr_number_match(addr1: str, addr2: str) -> float:
+    """Match building/street numbers in address strings.
+
+    Returns 1.0 if house numbers match, 0.0 if numbers conflict, 0.5 if no numbers.
+    """
+    import re
+    nums1 = set(re.findall(r'\b\d+\b', addr1))
+    nums2 = set(re.findall(r'\b\d+\b', addr2))
+    if not nums1 or not nums2:
+        return 0.5
+    intersection = len(nums1 & nums2)
+    union = len(nums1 | nums2)
+    return float(intersection / union)
+
+
 def compute_pair_features(name1: str, name2: str,
                           addr1: str, addr2: str,
                           country1: str, country2: str) -> np.ndarray:
@@ -66,11 +100,15 @@ def compute_pair_features(name1: str, name2: str,
 
     Returns a 1D numpy array with len(FEATURE_NAMES) values.
     """
-    # Normalize names (returns tuple: cleaned_name, legal_suffix)
     n1_clean, _ = normalize_business_name(name1)
     n2_clean, _ = normalize_business_name(name2)
     a1_clean = normalize_address(addr1)
     a2_clean = normalize_address(addr2)
+
+    tokens1 = n1_clean.split()
+    tokens2 = n2_clean.split()
+    first1 = tokens1[0] if tokens1 else ""
+    first2 = tokens2[0] if tokens2 else ""
 
     return np.array([
         jaccard_similarity(name1, name2),
@@ -78,9 +116,13 @@ def compute_pair_features(name1: str, name2: str,
         fuzz.partial_ratio(n1_clean, n2_clean) / 100.0,
         fuzz.token_sort_ratio(n1_clean, n2_clean) / 100.0,
         fuzz.token_set_ratio(n1_clean, n2_clean) / 100.0,
+        1.0 if n1_clean == n2_clean and n1_clean != "" else 0.0,
+        1.0 if first1 == first2 and first1 != "" else 0.0,
+        _phonetic_match_score(n1_clean, n2_clean),
         jaccard_similarity(addr1, addr2),
         fuzz.ratio(a1_clean, a2_clean) / 100.0,
         fuzz.partial_ratio(a1_clean, a2_clean) / 100.0,
+        _addr_number_match(a1_clean, a2_clean),
         1.0 if country1.lower() == country2.lower() and country1.strip() != "" else 0.0,
         _safe_len_ratio(n1_clean, n2_clean),
         _safe_len_ratio(a1_clean, a2_clean),

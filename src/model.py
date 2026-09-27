@@ -25,7 +25,7 @@ from src.features import FEATURE_NAMES, extract_batch_features
 class EntityMatchingModel:
     """Pairwise entity matching classifier with F0.5-optimized thresholding."""
 
-    def __init__(self, threshold: float = 0.5, model_type: str = "rf"):
+    def __init__(self, threshold: float = 0.5, model_type: str = "lgb"):
         self.threshold = threshold
         self.model_type = model_type
         if model_type == "rf":
@@ -33,6 +33,34 @@ class EntityMatchingModel:
                 n_estimators=200, max_depth=12, min_samples_leaf=5,
                 class_weight="balanced", random_state=42, n_jobs=-1,
             )
+        elif model_type in ("lgb", "lightgbm"):
+            try:
+                import lightgbm as lgb
+                self.model = lgb.LGBMClassifier(
+                    n_estimators=300, max_depth=8, learning_rate=0.05,
+                    num_leaves=31, scale_pos_weight=5.0, random_state=42, n_jobs=-1,
+                    verbose=-1,
+                )
+            except ImportError:
+                print("  ⚠️ LightGBM not installed — falling back to GradientBoostingClassifier")
+                self.model = GradientBoostingClassifier(
+                    n_estimators=200, max_depth=6, learning_rate=0.1,
+                    subsample=0.8, random_state=42,
+                )
+        elif model_type in ("xgb", "xgboost"):
+            try:
+                import xgboost as xgb
+                self.model = xgb.XGBClassifier(
+                    n_estimators=300, max_depth=6, learning_rate=0.05,
+                    scale_pos_weight=5.0, random_state=42, n_jobs=-1,
+                    eval_metric="logloss",
+                )
+            except ImportError:
+                print("  ⚠️ XGBoost not installed — falling back to GradientBoostingClassifier")
+                self.model = GradientBoostingClassifier(
+                    n_estimators=200, max_depth=6, learning_rate=0.1,
+                    subsample=0.8, random_state=42,
+                )
         elif model_type == "gbdt":
             self.model = GradientBoostingClassifier(
                 n_estimators=200, max_depth=6, learning_rate=0.1,
