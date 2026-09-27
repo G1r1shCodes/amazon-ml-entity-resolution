@@ -369,11 +369,14 @@ def generate_candidate_pairs(
     df_s3: pd.DataFrame,
     top_k_per_source: int = 30,
 ) -> pd.DataFrame:
-    """Generate candidate entity pairs using single-pass word TF-IDF blocking.
+    """Generate candidate entity pairs using dual-pass TF-IDF blocking.
+
+    Pass 1 — Word (1,2)-gram: catches exact/near-exact business name matches.
+    Pass 2 — Char (2,4)-gram: catches typos, glued domains, partial word overlap.
+    Candidates from both passes are unioned per query.
 
     Uses name + address text to capture Indic-name pairs sharing Latin addresses.
-    max_df=0.5 filters ultra-common tokens for better discrimination.
-    Sequential execution: S2 on cuda:0, then S3 on cuda:1 to stay under Kaggle RAM.
+    max_df=0.5 filters ultra-common tokens → sparser matmul → faster chunks.
     """
     import gc
     print("Preparing record text representations (name + address)...", flush=True)
@@ -387,22 +390,42 @@ def generate_candidate_pairs(
     dev_s2 = "cuda:0" if torch.cuda.is_available() else "cpu"
     dev_s3 = "cuda:1" if torch.cuda.device_count() > 1 else dev_s2
 
-    # ── S2 blocking ──
-    print(f"\n── S2 blocking on {dev_s2} ──", flush=True)
-    cands_s2 = _run_single_pass(
+    # ── S2 dual-pass blocking ──
+    print(f"\n{'='*60}", flush=True)
+    print(f"── S2 blocking on {dev_s2} (dual-pass) ──", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    cands_s2_word = _run_single_pass(
         "Word n-gram", s1_texts, s2_texts,
         top_k=top_k_per_source, device=dev_s2,
         analyzer="word", ngram_range=(1, 2), max_df=0.5, max_features=150_000,
     )
+    cands_s2_char = _run_single_pass(
+        "Char n-gram", s1_texts, s2_texts,
+        top_k=top_k_per_source, device=dev_s2,
+        analyzer="char_wb", ngram_range=(2, 4), max_df=0.5, max_features=200_000,
+    )
+    cands_s2 = _merge_candidate_indices(cands_s2_word, cands_s2_char)
+    del cands_s2_word, cands_s2_char
     gc.collect()
 
-    # ── S3 blocking ──
-    print(f"\n── S3 blocking on {dev_s3} ──", flush=True)
-    cands_s3 = _run_single_pass(
+    # ── S3 dual-pass blocking ──
+    print(f"\n{'='*60}", flush=True)
+    print(f"── S3 blocking on {dev_s3} (dual-pass) ──", flush=True)
+    print(f"{'='*60}", flush=True)
+
+    cands_s3_word = _run_single_pass(
         "Word n-gram", s1_texts, s3_texts,
         top_k=top_k_per_source, device=dev_s3,
         analyzer="word", ngram_range=(1, 2), max_df=0.5, max_features=150_000,
     )
+    cands_s3_char = _run_single_pass(
+        "Char n-gram", s1_texts, s3_texts,
+        top_k=top_k_per_source, device=dev_s3,
+        analyzer="char_wb", ngram_range=(2, 4), max_df=0.5, max_features=200_000,
+    )
+    cands_s3 = _merge_candidate_indices(cands_s3_word, cands_s3_char)
+    del cands_s3_word, cands_s3_char
     gc.collect()
 
     # ── Format results ──
