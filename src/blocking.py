@@ -167,16 +167,25 @@ class TFIDFBlocker:
         vocab_sample_size: int = 200_000,
         batch_size: int = 500_000,
     ) -> csr_matrix:
-        """Fit vocab on S1+target combined, transform all target records in batches."""
-        target_sample_n = max(0, vocab_sample_size - len(query_texts))
+        """Fit vocab on S1+target combined, transform all target records in batches.
+
+        Queries and targets are sampled independently so both S1 queries and target
+        records are always represented in the vocabulary, regardless of S1 dataset size.
+        """
+        query_sample_n = min(len(query_texts), vocab_sample_size // 4)
+        target_sample_n = min(len(target_texts), vocab_sample_size - query_sample_n)
         rng = np.random.default_rng(42)
+        query_sample = (
+            [query_texts[i] for i in rng.choice(len(query_texts), size=query_sample_n, replace=False)]
+            if len(query_texts) > query_sample_n else query_texts
+        )
         target_sample = (
             [target_texts[i] for i in rng.choice(len(target_texts), size=target_sample_n, replace=False)]
             if len(target_texts) > target_sample_n else target_texts
         )
-        fit_texts = list(query_texts) + target_sample
+        fit_texts = query_sample + target_sample
         print(f"  Fitting vocab on {len(fit_texts):,} texts "
-              f"({len(query_texts):,} S1 + {len(target_sample):,} target sample)...", flush=True)
+              f"({len(query_sample):,} S1 sample + {len(target_sample):,} target sample)...", flush=True)
         self.vectorizer.fit(fit_texts)
         print(f"  Vocab: {len(self.vectorizer.vocabulary_):,} features", flush=True)
 
