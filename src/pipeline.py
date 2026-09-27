@@ -99,27 +99,41 @@ def generate_candidate_pairs_fast(
     return df_candidates, pair_list
 
 
+def prepare_entity_lookup(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """Convert dataframe to lookup dict with pre-normalized text to accelerate feature extraction."""
+    from src.normalize import normalize_address, normalize_business_name
+    records = {}
+    for eid, name, addr, country in zip(
+        df["entity_id"],
+        df["business_name"].fillna(""),
+        df["business_address"].fillna(""),
+        df["country"].fillna(""),
+    ):
+        records[eid] = {
+            "business_name": name,
+            "business_address": addr,
+            "country": country,
+            "norm_name": normalize_business_name(name),
+            "norm_addr": normalize_address(addr),
+        }
+    return records
+
+
 def extract_features_for_pairs(
     pair_list: List[Tuple[str, str]],
-    df_s1: pd.DataFrame,
-    df_s2: pd.DataFrame,
-    df_s3: pd.DataFrame,
+    s1_dict: Dict[str, Dict[str, str]],
+    s23_dict: Dict[str, Dict[str, str]],
 ) -> Tuple[pd.DataFrame, np.ndarray]:
     """Compute feature vectors for candidate pairs in batches."""
-    print(f"Extracting similarity features for {len(pair_list):,} candidate pairs...")
+    print(f"Extracting similarity features for {len(pair_list):,} candidate pairs...", flush=True)
     t0 = time.time()
-
-    # Pre-index source rows into dicts for O(1) lookup
-    s1_dict = df_s1.set_index("entity_id").to_dict("index")
-    s2_dict = df_s2.set_index("entity_id").to_dict("index")
-    s3_dict = df_s3.set_index("entity_id").to_dict("index")
 
     feature_rows = []
     valid_pairs = []
 
     for s1_id, cand_id in pair_list:
         rec1 = s1_dict.get(s1_id)
-        rec2 = s2_dict.get(cand_id) or s3_dict.get(cand_id)
+        rec2 = s23_dict.get(cand_id)
         if not rec1 or not rec2:
             continue
 
@@ -131,7 +145,7 @@ def extract_features_for_pairs(
     X = df_feats.values
     df_pairs = pd.DataFrame(valid_pairs, columns=["source1_entity_id", "candidate_entity_id"])
 
-    print(f"Features extracted in {time.time() - t0:.2f}s across {X.shape[1]} similarity dimensions.")
+    print(f"Features extracted in {time.time() - t0:.2f}s across {X.shape[1]} similarity dimensions.", flush=True)
     return df_pairs, X
 
 
@@ -167,7 +181,11 @@ def run_validation_pipeline(
     blocking_results = compute_candidate_recall(cands_map, gt_map)
 
     # 3. Features
-    df_pairs, X = extract_features_for_pairs(pair_list, df_s1, df_s2, df_s3)
+    print("Preparing entity lookup tables with normalization caching...", flush=True)
+    s1_dict = prepare_entity_lookup(df_s1)
+    s23_dict = prepare_entity_lookup(df_s2)
+    s23_dict.update(prepare_entity_lookup(df_s3))
+    df_pairs, X = extract_features_for_pairs(pair_list, s1_dict, s23_dict)
 
     # 4. Create Ground Truth Binary Labels (y = 1 if cand_id in gt, else 0)
     y = []
@@ -259,8 +277,12 @@ def run_test_pipeline(
     save_results(df_candidates, cand_file, col_name="candidate_entity_ids")
 
     # 3. Feature Extraction
-    print("\n--- Step 2: Feature Extraction ---")
-    df_pairs, X = extract_features_for_pairs(pair_list, df_s1, df_s2, df_s3)
+    print("\n--- Step 2: Feature Extraction ---", flush=True)
+    print("Preparing entity lookup tables with normalization caching...", flush=True)
+    s1_dict = prepare_entity_lookup(df_s1)
+    s23_dict = prepare_entity_lookup(df_s2)
+    s23_dict.update(prepare_entity_lookup(df_s3))
+    df_pairs, X = extract_features_for_pairs(pair_list, s1_dict, s23_dict)
 
     # 4. Model Inference
     print("\n--- Step 3: Model Scoring ---")

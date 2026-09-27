@@ -15,7 +15,7 @@ class EntityMatchingModel:
 
     def __init__(self, threshold: float = 0.5):
         self.threshold = threshold
-        self.model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+        self.model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42, n_jobs=-1)
 
     def train(self, X_train: np.ndarray, y_train: np.ndarray) -> None:
         """Train binary matching classifier."""

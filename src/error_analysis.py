@@ -141,34 +141,37 @@ def print_error_summary(
     print("-" * 70)
 
     # Show Sample False Positives
+    def safe_str(val: any) -> str:
+        return str(val).encode("ascii", "replace").decode("ascii")
+
     if errors["false_positives"]:
         print(f"\n[SAMPLE FALSE POSITIVES (Why Did the System Mistakenly Merge?)]")
         for i, item in enumerate(errors["false_positives"][:n_sample], 1):
             print(f" {i}. S1: {item['source1_id']} vs Target: {item['target_id']} (Country: {item['country']})")
-            print(f"    S1 Name     : {item['s1_name']}")
-            print(f"    Target Name : {item['target_name']} (Name Sim: {item['name_similarity']}%)")
-            print(f"    S1 Address  : {item['s1_address']}")
-            print(f"    Target Addr : {item['target_address']} (Addr Sim: {item['addr_similarity']}%)")
+            print(f"    S1 Name     : {safe_str(item['s1_name'])}")
+            print(f"    Target Name : {safe_str(item['target_name'])} (Name Sim: {item['name_similarity']:.1f}%)")
+            print(f"    S1 Address  : {safe_str(item['s1_address'])}")
+            print(f"    Target Addr : {safe_str(item['target_address'])} (Addr Sim: {item['addr_similarity']:.1f}%)")
 
     # Show Sample Missing Candidates (Blocking Issue)
     if errors["false_negatives_blocking"]:
         print(f"\n[SAMPLE BLOCKING FAILURES (True Matches Not In candidate_pairs.tsv)]")
         for i, item in enumerate(errors["false_negatives_blocking"][:n_sample], 1):
             print(f" {i}. S1: {item['source1_id']} vs Target: {item['target_id']} (Country: {item['country']})")
-            print(f"    S1 Name     : {item['s1_name']}")
-            print(f"    Target Name : {item['target_name']} (Name Sim: {item['name_similarity']}%)")
-            print(f"    S1 Address  : {item['s1_address']}")
-            print(f"    Target Addr : {item['target_address']} (Addr Sim: {item['addr_similarity']}%)")
+            print(f"    S1 Name     : {safe_str(item['s1_name'])}")
+            print(f"    Target Name : {safe_str(item['target_name'])} (Name Sim: {item['name_similarity']:.1f}%)")
+            print(f"    S1 Address  : {safe_str(item['s1_address'])}")
+            print(f"    Target Addr : {safe_str(item['target_address'])} (Addr Sim: {item['addr_similarity']:.1f}%)")
 
     # Show Sample Model Rejections
     if errors["false_negatives_model"]:
         print(f"\n[SAMPLE MODEL FAILURES (Present in Candidates but Scored Low)]")
         for i, item in enumerate(errors["false_negatives_model"][:n_sample], 1):
             print(f" {i}. S1: {item['source1_id']} vs Target: {item['target_id']} (Country: {item['country']})")
-            print(f"    S1 Name     : {item['s1_name']}")
-            print(f"    Target Name : {item['target_name']} (Name Sim: {item['name_similarity']}%)")
-            print(f"    S1 Address  : {item['s1_address']}")
-            print(f"    Target Addr : {item['target_address']} (Addr Sim: {item['addr_similarity']}%)")
+            print(f"    S1 Name     : {safe_str(item['s1_name'])}")
+            print(f"    Target Name : {safe_str(item['target_name'])} (Name Sim: {item['name_similarity']:.1f}%)")
+            print(f"    S1 Address  : {safe_str(item['s1_address'])}")
+            print(f"    Target Addr : {safe_str(item['target_address'])} (Addr Sim: {item['addr_similarity']:.1f}%)")
 
     print("\n" + "=" * 70 + "\n")
 

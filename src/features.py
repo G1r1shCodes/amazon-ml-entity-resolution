@@ -32,16 +32,22 @@ def compute_pair_features(record_s1: pd.Series, record_cand: pd.Series) -> Dict[
     country1 = str(record_s1["country"])
     country2 = str(record_cand["country"])
 
+    norm_name1 = record_s1.get("norm_name") or normalize_business_name(name1)
+    norm_name2 = record_cand.get("norm_name") or normalize_business_name(name2)
+
+    norm_addr1 = record_s1.get("norm_addr") or normalize_address(addr1)
+    norm_addr2 = record_cand.get("norm_addr") or normalize_address(addr2)
+
     features: Dict[str, float] = {
         # Name similarity features
-        "name_jaccard": jaccard_similarity(name1, name2),
-        "name_levenshtein": float(fuzz.ratio(normalize_business_name(name1), normalize_business_name(name2)) / 100.0),
-        "name_partial_ratio": float(fuzz.partial_ratio(normalize_business_name(name1), normalize_business_name(name2)) / 100.0),
-        "name_token_sort": float(fuzz.token_sort_ratio(normalize_business_name(name1), normalize_business_name(name2)) / 100.0),
+        "name_jaccard": jaccard_similarity(norm_name1, norm_name2),
+        "name_levenshtein": float(fuzz.ratio(norm_name1, norm_name2) / 100.0),
+        "name_partial_ratio": float(fuzz.partial_ratio(norm_name1, norm_name2) / 100.0),
+        "name_token_sort": float(fuzz.token_sort_ratio(norm_name1, norm_name2) / 100.0),
 
         # Address similarity features
-        "address_jaccard": jaccard_similarity(addr1, addr2),
-        "address_levenshtein": float(fuzz.ratio(normalize_address(addr1), normalize_address(addr2)) / 100.0),
+        "address_jaccard": jaccard_similarity(norm_addr1, norm_addr2),
+        "address_levenshtein": float(fuzz.ratio(norm_addr1, norm_addr2) / 100.0),
 
         # Metadata features
         "same_country": 1.0 if country1.lower() == country2.lower() and country1 != "" else 0.0,
