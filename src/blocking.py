@@ -24,7 +24,13 @@ import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 from scipy.sparse import csr_matrix
 
-from src.normalize import normalize_address, normalize_business_name, clean_text
+from src.normalize import (
+    clean_text,
+    normalize_address,
+    normalize_business_name,
+    strip_dba_markers,
+    strip_legal_suffixes,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -32,18 +38,14 @@ from src.normalize import normalize_address, normalize_business_name, clean_text
 # ---------------------------------------------------------------------------
 
 def _normalize_text_fast(text: str) -> str:
-    """Lowercase + accent strip + remove legal suffixes + punctuation cleanup."""
-    import unicodedata, re
-    text = unicodedata.normalize("NFKD", str(text))
-    text = "".join(c for c in text if not unicodedata.combining(c))
-    text = text.lower()
-    text = re.sub(
-        r'\b(llc|ltd|inc|corp|co|plc|gmbh|llp|lp|sa|srl|sl|bv|nv|ag|oy|ab|as|pte|pvt|sas|kk|kg)\b\.?',
-        '', text
-    )
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+    """Vectorizer text prep: shared normalizer + legal-suffix stripping.
+
+    Delegates to ``src.normalize`` so blocking text and model features can never diverge
+    again. The previous private implementation had its own legal-suffix word list and
+    applied an unconditional NFKD fold, which shredded Indic scripts
+    ("राम मार्केटिंग" -> "र म म रक ट ग") and kept a divergent token stream.
+    """
+    return strip_legal_suffixes(clean_text(strip_dba_markers(text)))
 
 
 def get_record_texts(df: pd.DataFrame) -> List[str]:
