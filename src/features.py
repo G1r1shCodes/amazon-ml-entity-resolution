@@ -2,13 +2,41 @@
 
 Assigned to: Person 2 (similarity features & training pairs)
 Computes pairwise similarity features between Source 1 records and Candidate records.
+
+Batch processing: `extract_batch_features()` computes features for all candidate pairs
+at once using vectorized string operations and rapidfuzz batch scoring.
 """
 
-from typing import Dict, Any, List
+import time
+from typing import Dict, List, Set, Tuple, Optional
+import numpy as np
 import pandas as pd
-from rapidfuzz import distance, fuzz
-from src.normalize import clean_text, normalize_address, normalize_business_name
+from rapidfuzz import fuzz
+from src.normalize import clean_text, normalize_address, normalize_business_name, pd_isna
 
+
+# ---------------------------------------------------------------------------
+# Feature names (order matters — must match columns in feature matrix)
+# ---------------------------------------------------------------------------
+
+FEATURE_NAMES = [
+    "name_jaccard",
+    "name_levenshtein",
+    "name_partial_ratio",
+    "name_token_sort",
+    "name_token_set",
+    "addr_jaccard",
+    "addr_levenshtein",
+    "addr_partial_ratio",
+    "same_country",
+    "name_len_ratio",
+    "addr_len_ratio",
+]
+
+
+# ---------------------------------------------------------------------------
+# Single-pair feature computation
+# ---------------------------------------------------------------------------
 
 def jaccard_similarity(str1: str, str2: str) -> float:
     """Compute token-based Jaccard similarity between two strings."""
@@ -21,36 +49,169 @@ def jaccard_similarity(str1: str, str2: str) -> float:
     return float(intersection / union)
 
 
-def compute_pair_features(record_s1: pd.Series, record_cand: pd.Series) -> Dict[str, float]:
-    """Compute pairwise similarity features between an S1 record and a candidate record."""
-    name1 = str(record_s1["business_name"])
-    name2 = str(record_cand["business_name"])
+def _safe_len_ratio(a: str, b: str) -> float:
+    """Length ratio: min(len(a), len(b)) / max(len(a), len(b))."""
+    la, lb = len(a), len(b)
+    if la == 0 and lb == 0:
+        return 1.0
+    if la == 0 or lb == 0:
+        return 0.0
+    return min(la, lb) / max(la, lb)
 
-    addr1 = str(record_s1["business_address"])
-    addr2 = str(record_cand["business_address"])
 
-    country1 = str(record_s1["country"])
-    country2 = str(record_cand["country"])
+def compute_pair_features(name1: str, name2: str,
+                          addr1: str, addr2: str,
+                          country1: str, country2: str) -> np.ndarray:
+    """Compute feature vector for a single S1-candidate pair.
 
-    norm_name1 = record_s1.get("norm_name") or normalize_business_name(name1)
-    norm_name2 = record_cand.get("norm_name") or normalize_business_name(name2)
+    Returns a 1D numpy array with len(FEATURE_NAMES) values.
+    """
+    # Normalize names (returns tuple: cleaned_name, legal_suffix)
+    n1_clean, _ = normalize_business_name(name1)
+    n2_clean, _ = normalize_business_name(name2)
+    a1_clean = normalize_address(addr1)
+    a2_clean = normalize_address(addr2)
 
-    norm_addr1 = record_s1.get("norm_addr") or normalize_address(addr1)
-    norm_addr2 = record_cand.get("norm_addr") or normalize_address(addr2)
+    return np.array([
+        jaccard_similarity(name1, name2),
+        fuzz.ratio(n1_clean, n2_clean) / 100.0,
+        fuzz.partial_ratio(n1_clean, n2_clean) / 100.0,
+        fuzz.token_sort_ratio(n1_clean, n2_clean) / 100.0,
+        fuzz.token_set_ratio(n1_clean, n2_clean) / 100.0,
+        jaccard_similarity(addr1, addr2),
+        fuzz.ratio(a1_clean, a2_clean) / 100.0,
+        fuzz.partial_ratio(a1_clean, a2_clean) / 100.0,
+        1.0 if country1.lower() == country2.lower() and country1.strip() != "" else 0.0,
+        _safe_len_ratio(n1_clean, n2_clean),
+        _safe_len_ratio(a1_clean, a2_clean),
+    ], dtype=np.float32)
 
-    features: Dict[str, float] = {
-        # Name similarity features
-        "name_jaccard": jaccard_similarity(norm_name1, norm_name2),
-        "name_levenshtein": float(fuzz.ratio(norm_name1, norm_name2) / 100.0),
-        "name_partial_ratio": float(fuzz.partial_ratio(norm_name1, norm_name2) / 100.0),
-        "name_token_sort": float(fuzz.token_sort_ratio(norm_name1, norm_name2) / 100.0),
 
-        # Address similarity features
-        "address_jaccard": jaccard_similarity(norm_addr1, norm_addr2),
-        "address_levenshtein": float(fuzz.ratio(norm_addr1, norm_addr2) / 100.0),
+# ---------------------------------------------------------------------------
+# Batch feature extraction
+# ---------------------------------------------------------------------------
 
-        # Metadata features
-        "same_country": 1.0 if country1.lower() == country2.lower() and country1 != "" else 0.0,
-    }
+def _build_lookup(df: pd.DataFrame) -> Dict[str, Dict[str, str]]:
+    """Build entity_id -> {business_name, business_address, country} lookup dict."""
+    records = {}
+    for _, row in df.iterrows():
+        records[str(row["entity_id"])] = {
+            "business_name": str(row.get("business_name", "")),
+            "business_address": str(row.get("business_address", "")),
+            "country": str(row.get("country", "")),
+        }
+    return records
 
-    return features
+
+def extract_batch_features(
+    df_s1: pd.DataFrame,
+    df_s2: pd.DataFrame,
+    df_s3: pd.DataFrame,
+    candidates_df: pd.DataFrame,
+    gt_map: Optional[Dict[str, Set[str]]] = None,
+    max_pairs_per_s1: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray, List[Tuple[str, str]]]:
+    """Extract features for all S1-candidate pairs in batch.
+
+    Args:
+        df_s1: Source 1 records.
+        df_s2: Source 2 records (for looking up candidate details).
+        df_s3: Source 3 records (for looking up candidate details).
+        candidates_df: DataFrame with columns [source1_entity_id, candidate_entity_ids].
+        gt_map: Ground truth mapping s1_id -> set of matched entity IDs.
+                 If provided, labels are generated (1 = match, 0 = non-match).
+                 If None, labels are all -1 (inference mode).
+        max_pairs_per_s1: Limit candidates per S1 record (for memory control).
+
+    Returns:
+        X: Feature matrix of shape (n_pairs, n_features).
+        y: Label vector of shape (n_pairs,). 1=match, 0=non-match, -1=unknown.
+        pair_ids: List of (s1_id, candidate_id) tuples for each row.
+    """
+    t0 = time.time()
+    print("Building entity lookup tables...", flush=True)
+
+    # Build lookups — only for entities that appear in candidates or S1 sample
+    s1_ids_needed = set(candidates_df["source1_entity_id"].tolist())
+    s1_subset = df_s1[df_s1["entity_id"].isin(s1_ids_needed)]
+    s1_lookup = _build_lookup(s1_subset)
+
+    # Collect all candidate IDs to filter S2/S3 lookups
+    all_cand_ids = set()
+    for _, row in candidates_df.iterrows():
+        cand_str = str(row.get("candidate_entity_ids", ""))
+        for c in cand_str.split(","):
+            c = c.strip()
+            if c:
+                all_cand_ids.add(c)
+
+    s2_subset = df_s2[df_s2["entity_id"].isin(all_cand_ids)]
+    s3_subset = df_s3[df_s3["entity_id"].isin(all_cand_ids)]
+    cand_lookup = {**_build_lookup(s2_subset), **_build_lookup(s3_subset)}
+
+    print(f"  S1: {len(s1_lookup):,}, Candidates: {len(cand_lookup):,} "
+          f"(built in {time.time()-t0:.1f}s)", flush=True)
+
+    # Expand candidate pairs into flat list
+    print("Expanding candidate pairs...", flush=True)
+    pair_ids: List[Tuple[str, str]] = []
+    for _, row in candidates_df.iterrows():
+        s1_id = str(row["source1_entity_id"])
+        cand_str = str(row.get("candidate_entity_ids", ""))
+        if not cand_str.strip():
+            continue
+        cand_ids = [c.strip() for c in cand_str.split(",") if c.strip()]
+        if max_pairs_per_s1 and len(cand_ids) > max_pairs_per_s1:
+            cand_ids = cand_ids[:max_pairs_per_s1]
+        for cid in cand_ids:
+            pair_ids.append((s1_id, cid))
+
+    n_pairs = len(pair_ids)
+    n_features = len(FEATURE_NAMES)
+    print(f"  {n_pairs:,} total pairs to featurize", flush=True)
+
+    # Allocate feature matrix and label vector
+    X = np.zeros((n_pairs, n_features), dtype=np.float32)
+    y = np.full(n_pairs, -1, dtype=np.int8)
+
+    # Compute features for each pair
+    print("Computing features...", flush=True)
+    t1 = time.time()
+    progress_interval = max(1, n_pairs // 10)
+
+    for i, (s1_id, cand_id) in enumerate(pair_ids):
+        s1_rec = s1_lookup.get(s1_id)
+        cand_rec = cand_lookup.get(cand_id)
+
+        if s1_rec is None or cand_rec is None:
+            continue
+
+        X[i] = compute_pair_features(
+            s1_rec["business_name"], cand_rec["business_name"],
+            s1_rec["business_address"], cand_rec["business_address"],
+            s1_rec["country"], cand_rec["country"],
+        )
+
+        # Generate label from ground truth
+        if gt_map is not None:
+            matched = gt_map.get(s1_id, set())
+            y[i] = 1 if cand_id in matched else 0
+
+        if (i + 1) % progress_interval == 0:
+            elapsed = time.time() - t1
+            rate = (i + 1) / elapsed
+            remaining = (n_pairs - i - 1) / rate
+            print(f"  {i+1:,}/{n_pairs:,} pairs ({rate:.0f} pairs/s, "
+                  f"~{remaining:.0f}s remaining)", flush=True)
+
+    elapsed = time.time() - t0
+    print(f"✅ Feature extraction complete: {n_pairs:,} pairs x {n_features} features "
+          f"in {elapsed:.1f}s", flush=True)
+
+    if gt_map is not None:
+        n_pos = int((y == 1).sum())
+        n_neg = int((y == 0).sum())
+        print(f"  Labels: {n_pos:,} positive, {n_neg:,} negative "
+              f"(ratio 1:{n_neg//max(n_pos,1)})", flush=True)
+
+    return X, y, pair_ids
